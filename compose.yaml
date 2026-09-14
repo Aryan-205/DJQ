@@ -1,4 +1,15 @@
 services:
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      VITE_PROXY_TARGET: http://api:3000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
   api:
     build: .
     init: true
@@ -6,6 +17,8 @@ services:
       PORT: 3000
       DATABASE_URL: postgresql://djqueue:djqueue@postgres:5432/djqueue
       REDIS_URL: redis://redis:6379
+      WEB_ORIGIN: http://localhost:5173
+      DEMO_WORKER_AUTO_START: "true"
     ports:
       - "3000:3000"
     depends_on:

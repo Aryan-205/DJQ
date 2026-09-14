@@ -1,139 +1,63 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { Pool } from "pg";
 
-import { QueueError, type JsonObject, type SubmitJobInput } from "./domain/job.ts";
+import { createApp } from "./api/app.ts";
+import { DemoWorker } from "./application/demo-worker.ts";
+import { MemoryEventBroker, type EventBroker } from "./application/event-broker.ts";
+import type { JobStore } from "./application/job-store.ts";
 import { InMemoryJobStore } from "./infrastructure/in-memory-job-store.ts";
+import { runMigrations } from "./infrastructure/migrate.ts";
+import { OutboxRelay } from "./infrastructure/outbox-relay.ts";
+import { PostgresJobStore } from "./infrastructure/postgres-job-store.ts";
+import { RedisEventBroker } from "./infrastructure/redis-event-broker.ts";
 
-const store = new InMemoryJobStore();
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 
-function sendJson(response: ServerResponse, statusCode: number, body: unknown): void {
-  response.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
-  response.end(JSON.stringify(body));
-}
-
-async function readJson(request: IncomingMessage): Promise<JsonObject> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.from(chunk);
-    size += buffer.length;
-    if (size > 1_000_000) {
-      throw new QueueError("PAYLOAD_TOO_LARGE", "Request body exceeds 1 MB", 413);
-    }
-    chunks.push(buffer);
+async function bootstrap() {
+  let broker: EventBroker;
+  if (process.env.REDIS_URL) {
+    broker = await RedisEventBroker.connect(process.env.REDIS_URL);
+    console.log("Connected to Redis event broker");
+  } else {
+    broker = new MemoryEventBroker();
+    console.log("Using in-memory event broker");
   }
 
-  if (chunks.length === 0) return {};
-  try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("body must be an object");
-    }
-    return value as JsonObject;
-  } catch {
-    throw new QueueError("INVALID_JSON", "Request body must be valid JSON", 400);
-  }
-}
-
-function requiredString(body: JsonObject, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new QueueError("VALIDATION_ERROR", `${field} must be a non-empty string`, 400);
-  }
-  return value.trim();
-}
-
-async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const method = request.method ?? "GET";
-  const url = new URL(request.url ?? "/", "http://localhost");
-
-  if (method === "GET" && url.pathname === "/health/live") {
-    sendJson(response, 200, { status: "ok" });
-    return;
+  let store: JobStore;
+  let outboxRelay: OutboxRelay | undefined;
+  if (process.env.DATABASE_URL && process.env.STORE_DRIVER !== "memory") {
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    await runMigrations(pool);
+    store = new PostgresJobStore(pool);
+    outboxRelay = new OutboxRelay(pool, broker);
+    outboxRelay.start();
+    console.log("Using PostgreSQL job store");
+  } else {
+    store = new InMemoryJobStore((event) => broker.publish(event));
+    console.log("Using in-memory job store");
   }
 
-  if (method === "POST" && url.pathname === "/v1/jobs") {
-    const body = await readJson(request);
-    const payload = body.payload ?? {};
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      throw new QueueError("VALIDATION_ERROR", "payload must be an object", 400);
-    }
-
-    const input: SubmitJobInput = {
-      queue: requiredString(body, "queue"),
-      type: requiredString(body, "type"),
-      payload: payload as JsonObject,
-      idempotencyKey:
-        typeof request.headers["idempotency-key"] === "string"
-          ? request.headers["idempotency-key"]
-          : undefined,
-    };
-    if (typeof body.priority === "number") input.priority = body.priority;
-    if (typeof body.maxRetries === "number") input.maxRetries = body.maxRetries;
-
-    const submitted = await store.submit(input);
-    sendJson(response, submitted.created ? 201 : 200, submitted.job);
-    return;
-  }
-
-  const claimMatch = url.pathname.match(/^\/v1\/queues\/([^/]+)\/jobs\/claim$/);
-  if (method === "POST" && claimMatch) {
-    const claimed = await store.claim(decodeURIComponent(claimMatch[1]));
-    if (!claimed) {
-      response.writeHead(204);
-      response.end();
-      return;
-    }
-    sendJson(response, 200, claimed);
-    return;
-  }
-
-  const completeMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/complete$/);
-  if (method === "POST" && completeMatch) {
-    const body = await readJson(request);
-    const leaseId = requiredString(body, "leaseId");
-    const result = body.result ?? {};
-    if (!result || typeof result !== "object" || Array.isArray(result)) {
-      throw new QueueError("VALIDATION_ERROR", "result must be an object", 400);
-    }
-    const job = await store.complete(
-      decodeURIComponent(completeMatch[1]),
-      leaseId,
-      result as JsonObject,
-    );
-    sendJson(response, 200, job);
-    return;
-  }
-
-  const jobMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)$/);
-  if (method === "GET" && jobMatch) {
-    const job = await store.get(decodeURIComponent(jobMatch[1]));
-    if (!job) throw new QueueError("JOB_NOT_FOUND", "Job not found", 404);
-    sendJson(response, 200, job);
-    return;
-  }
-
-  throw new QueueError("ROUTE_NOT_FOUND", "Route not found", 404);
-}
-
-export const server = createServer((request, response) => {
-  route(request, response).catch((error: unknown) => {
-    if (error instanceof QueueError) {
-      sendJson(response, error.statusCode, {
-        error: { code: error.code, message: error.message },
-      });
-      return;
-    }
-
-    console.error(error);
-    sendJson(response, 500, {
-      error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred" },
-    });
-  });
-});
-
-if (process.env.NODE_ENV !== "test") {
-  server.listen(port, () => {
+  const worker = new DemoWorker(store);
+  if (process.env.DEMO_WORKER_AUTO_START !== "false") worker.start();
+  const app = createApp({ store, broker, worker });
+  const server = app.listen(port, () => {
     console.log(`Distributed job queue API listening on http://localhost:${port}`);
   });
+
+  let shuttingDown = false;
+  async function shutdown(signal: string): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received; shutting down`);
+    worker.stop();
+    outboxRelay?.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await store.close?.();
+    await broker.close();
+  }
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  return server;
 }
+
+export const server = await bootstrap();

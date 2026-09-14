@@ -41,3 +41,19 @@ The target is **at-least-once delivery**. A worker can finish an external side e
 ### Next experiment
 
 Create the PostgreSQL schema and a repository contract test. Run the same lifecycle suite against both adapters, then add a concurrency test that starts many claims against a fixed set of jobs. This will make the difference between an in-process method call and a genuinely atomic distributed claim concrete.
+
+## Checkpoint 1 — Committing to the application stack
+
+### Stack decision
+
+The API now uses Express with TypeScript. Node.js executes erasable TypeScript syntax directly, while the TypeScript compiler performs strict static checks. Docker Compose defines the API, PostgreSQL, and Redis development services. The current store is still in memory so the next persistence step can be measured against a passing behavior suite.
+
+### Why both PostgreSQL and Redis?
+
+They have different jobs. PostgreSQL is authoritative for durable job state, leases, idempotency, and immutable events. Redis provides a low-latency ready-work signal/index, worker presence, rate limits, and disposable operational state. A worker may discover a candidate through Redis, but a PostgreSQL transaction decides whether that worker actually owns the lease.
+
+Writing independently to PostgreSQL and Redis would create a dual-write failure: the database commit could succeed while Redis publication fails. The planned transactional outbox records publication work beside the job mutation. A relay retries the Redis update, and periodic reconciliation rebuilds Redis from PostgreSQL. Losing Redis can delay work but must not lose accepted jobs.
+
+### Why is Kafka later?
+
+Kafka becomes valuable when multiple independent systems need durable ordered lifecycle events—for audit, analytics, webhooks, and integrations. It is unnecessary for the first claim/complete path and would add operational concepts before leases and recovery are proven. Later, Kafka will consume the same outbox pattern without becoming the authority for job status.

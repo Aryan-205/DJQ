@@ -77,7 +77,7 @@ Every milestone should add a short note to `docs/LEARNING_LOG.md` covering what 
 - arbitrary user code execution inside the queue server;
 - multi-region consensus;
 - exactly-once delivery guarantees;
-- Kafka/SQS protocol compatibility;
+- Kafka on the initial job-delivery critical path (it is added later for durable event distribution);
 - a production Kubernetes operator;
 - unbounded payload storage (large payloads should eventually use object storage and references).
 
@@ -86,18 +86,22 @@ Every milestone should add a short note to `docs/LEARNING_LOG.md` covering what 
 | Concern | Choice | Reason |
 |---|---|---|
 | Runtime | Node.js 24 + TypeScript | Available locally, fast feedback, and readable types for the state machine |
-| V1 HTTP | Node standard library | Keeps the first slice dependency-free and exposes the mechanics |
+| HTTP API | Express 5 | Familiar routing/middleware model with clean support for validation, auth, SSE, and error handling |
 | Durable store | PostgreSQL | Transactions and `FOR UPDATE SKIP LOCKED` make atomic claims explicit |
+| Fast queue path | Redis | Ready-job indexes/signals, worker presence, rate limits, and short-lived operational state |
 | Local environment | Docker Compose | Reproducible API, database, and worker setup |
-| Tests | Node test runner | Runs without a test framework dependency |
+| Backend tests | Node test runner + TypeScript compiler | Native execution with strict static checking and no large test framework |
 | Frontend | React + TypeScript + Vite | Fast local development and a strong portfolio-friendly component model |
 | Live updates | Server-Sent Events (SSE) | Simple ordered server-to-browser updates with built-in reconnection |
 | Frontend state | REST snapshot + event reducer | Makes synchronization behavior explicit and testable |
 | Metrics | Prometheus-compatible endpoint | Common operational model and easy local visualization |
 | Tracing | OpenTelemetry | Shows producer-to-worker execution across processes |
+| Later event backbone | Kafka | Durable fan-out for analytics, audit consumers, webhooks, and integrations after the core queue works |
 | Visualization | Purpose-built flow and timeline components | Shows queue behavior without hiding it behind a generic admin table |
 
-Redis is not required for correctness in the first durable version. It may be added later as an optimization or compared against PostgreSQL in a benchmark. This prevents the project from becoming only a wrapper around an existing queue library.
+PostgreSQL remains the source of truth for jobs, leases, idempotency, and immutable events. Redis accelerates the hot path but must not be the only place a job exists. A transactional outbox records Redis publication work in the same PostgreSQL transaction as the job change; a relay updates Redis, and a reconciler repairs missed entries. If Redis is flushed or unavailable, jobs are delayed rather than lost and can be rebuilt from PostgreSQL.
+
+Kafka is intentionally later. Once the queue is reliable, the PostgreSQL outbox can also publish lifecycle events to Kafka for multiple independent consumers. Kafka is not required to decide who owns a job lease, so adding it does not create a second authority for job state.
 
 ## 6. Architecture
 
@@ -108,23 +112,30 @@ Browser UI
   +-- live updates (SSE) <----------------|--------------+     |
                                          v              |     |
 Producer -----------------------> +------------------+   |     |
-Admin --------------------------> | API instance(s)  |---+     |
+Admin --------------------------> | Express API(s)   |---+     |
                                   +---------+--------+         |
                                             |                  |
+                               transaction writes              |
+                                            v                  |
                                      PostgreSQL ---------------+
-                              jobs + leases + immutable events
+                       jobs + leases + events + outbox
                                             |
-                             +--------------+---------------+
-                             |                              |
-                      Scheduler / reaper              Worker pool
-                    releases delayed jobs       claim -> run -> ack/fail
-                             |                              |
-                             +--------------+---------------+
+                                      outbox relay
                                             |
-                                 metrics, logs, traces
+                                            v
+                               Redis ready path / signals
+                                  |                 |
+                         Scheduler / reaper     Worker pool
+                       releases eligible jobs  claim in PostgreSQL
+                                  |                 |
+                                  +--------+--------+
+                                           |
+                                metrics, logs, traces
+
+Later: PostgreSQL outbox -> Kafka -> analytics / audit / webhooks / integrations
 ```
 
-PostgreSQL is the source of truth. A job claim is a transaction, not a read followed by an unrelated write. API instances and workers remain stateless so they can scale horizontally. The frontend is a projection of server state: it sends commands but never invents lifecycle transitions locally.
+PostgreSQL is the source of truth. Redis tells workers that work may be available, but the PostgreSQL transaction decides whether a claim succeeds and records the lease. API instances and workers remain stateless so they can scale horizontally. The frontend is a projection of server state: it sends commands but never invents lifecycle transitions locally.
 
 ## 7. Job state machine
 
@@ -350,6 +361,17 @@ Important indexes:
 - `metadata` (JSONB)
 - `created_at`
 
+### `outbox_events`
+
+- `id` (monotonically sortable identifier)
+- `topic` and `event_type`
+- `aggregate_id` (usually the job ID)
+- `payload` (JSONB)
+- `created_at`, `published_at`
+- `attempts`, `last_error`
+
+The outbox is written in the same PostgreSQL transaction as the job mutation. Relays publish to Redis initially and Kafka later. Consumers must tolerate duplicate delivery.
+
 ## 12. Milestones
 
 ### Milestone 0 — Foundation (current)
@@ -358,6 +380,9 @@ Deliverables:
 
 - [x] architecture and learning plan;
 - [x] dependency-free TypeScript project scaffold;
+- [x] Express HTTP layer with centralized JSON/error middleware;
+- [x] TypeScript compiler plus native Node.js TypeScript development/test tooling;
+- [x] Docker Compose foundation for API, PostgreSQL, and Redis;
 - [x] in-memory job store behind an interface;
 - [x] submit, status, claim, and complete endpoints;
 - [x] lease validation and idempotent submission;
@@ -392,10 +417,13 @@ Acceptance test: create a job entirely from the browser and watch it move from `
 
 Deliverables:
 
-- [ ] Docker Compose with PostgreSQL;
+- [ ] wire the PostgreSQL repository through the Docker Compose environment;
 - [ ] schema migrations for queues, jobs, and job events;
 - [ ] PostgreSQL repository adapter;
 - [ ] atomic claim using a transaction and `FOR UPDATE SKIP LOCKED`;
+- [ ] transactional outbox and Redis publication relay;
+- [ ] Redis ready-job index/signals with PostgreSQL reconciliation;
+- [ ] Redis-backed worker presence and heartbeat expiry;
 - [ ] worker process with configurable concurrency;
 - [ ] integration tests against a real database;
 - [ ] graceful shutdown and health endpoints.
@@ -450,7 +478,23 @@ Acceptance test: scale API and worker replicas during a load test without job lo
 
 Frontend checkpoint: the worker view updates as replicas join, leave, become busy, or stop heartbeating, while large job volumes fall back to aggregated counts instead of animating every item.
 
-### Milestone 6 — Production and portfolio finish
+### Milestone 6 — Kafka event distribution
+
+Deliverables:
+
+- [ ] add Kafka to an opt-in Docker Compose profile;
+- [ ] publish versioned job lifecycle events from the PostgreSQL outbox;
+- [ ] define topic naming, partition keys, retention, and schema evolution rules;
+- [ ] build one audit/history consumer and one webhook/notification consumer;
+- [ ] implement consumer idempotency and dead-letter handling;
+- [ ] test replay, duplicate delivery, consumer restart, and partition ordering;
+- [ ] document when Redis, PostgreSQL, and Kafka should each be used.
+
+Acceptance test: replay the lifecycle topic into a fresh audit consumer and reconstruct the same ordered history for each job without changing authoritative queue state.
+
+Frontend checkpoint: expose Kafka consumer lag and event-publication health as operational information, while continuing to read authoritative job state from the API.
+
+### Milestone 7 — Production and portfolio finish
 
 Deliverables:
 
@@ -489,8 +533,9 @@ DJQ/
 ├── src/
 │   ├── domain/          # job types, rules, errors
 │   ├── application/     # queue use cases
-│   ├── infrastructure/  # in-memory/PostgreSQL adapters, telemetry
-│   └── server.ts        # HTTP composition root
+│   ├── infrastructure/  # PostgreSQL, Redis, outbox, Kafka, telemetry
+│   ├── api/             # Express app, routes, middleware, controllers
+│   └── server.ts        # process composition and graceful shutdown
 ├── web/
 │   ├── src/
 │   │   ├── api/         # REST client, SSE client, reconciliation
@@ -507,6 +552,7 @@ DJQ/
 │   └── LEARNING_LOG.md
 ├── scripts/
 ├── compose.yaml
+├── Dockerfile
 ├── package.json
 └── PLAN.md
 ```
@@ -529,11 +575,12 @@ Good portfolio evidence is measured behavior, not a long feature list. Preserve 
 
 ## 16. Immediate next steps
 
-1. Add immutable in-memory job events and record every existing transition.
+1. Add immutable in-memory job events and record every existing transition through Express routes.
 2. Add job-list, system-snapshot, and SSE event-stream endpoints.
 3. Scaffold the React/Vite frontend and shared transport contracts.
 4. Build the create-job playground, demo worker, live flow, and job timeline.
-5. Add PostgreSQL and migrations, then make the same UI survive process restarts.
+5. Replace the in-memory adapter with PostgreSQL, then add the Redis ready path through an outbox.
+6. Add Kafka only after the core delivery/recovery behavior and frontend demo are reliable.
 
 ## 17. Definition of done
 

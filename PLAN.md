@@ -374,7 +374,7 @@ The outbox is written in the same PostgreSQL transaction as the job mutation. Re
 
 ## 12. Milestones
 
-### Milestone 0 — Foundation (current)
+### Milestone 0 — Foundation (complete)
 
 Deliverables:
 
@@ -402,14 +402,15 @@ A wrong lease must be rejected and a repeated idempotency key must return the or
 
 Deliverables:
 
-- [ ] React/Vite frontend scaffold with shared API contracts;
-- [ ] in-memory lifecycle events with monotonic event IDs;
-- [ ] job list, system snapshot, and SSE endpoints;
-- [ ] create-job playground with JSON validation and generated `curl` command;
-- [ ] live flow lanes and job inspector timeline;
-- [ ] a demo worker that makes jobs visibly move through the happy path;
-- [ ] reconnect/stale indicators and snapshot reconciliation;
-- [ ] frontend unit tests and one browser end-to-end test.
+- [x] React/Vite frontend scaffold with shared API contracts;
+- [x] in-memory lifecycle events with monotonic event IDs;
+- [x] job list, system snapshot, and SSE endpoints;
+- [x] create-job playground with JSON validation and generated `curl` command;
+- [x] live flow lanes and job inspector timeline;
+- [x] a demo worker that makes jobs visibly move through the happy path;
+- [x] reconnect/stale indicators and snapshot reconciliation;
+- [x] manual browser end-to-end verification of live transitions;
+- [ ] automated frontend component and browser tests.
 
 Acceptance test: create a job entirely from the browser and watch it move from `queued` to `processing` to `completed` without refreshing. Opening the job must show the same ordered events returned by the API.
 
@@ -417,16 +418,16 @@ Acceptance test: create a job entirely from the browser and watch it move from `
 
 Deliverables:
 
-- [ ] wire the PostgreSQL repository through the Docker Compose environment;
-- [ ] schema migrations for queues, jobs, and job events;
-- [ ] PostgreSQL repository adapter;
-- [ ] atomic claim using a transaction and `FOR UPDATE SKIP LOCKED`;
-- [ ] transactional outbox and Redis publication relay;
+- [x] wire the PostgreSQL repository through the Docker Compose environment;
+- [x] schema migrations for queues, jobs, job events, and outbox events;
+- [x] PostgreSQL repository adapter;
+- [x] atomic claim using a transaction and `FOR UPDATE SKIP LOCKED`;
+- [x] transactional outbox and Redis publication relay;
 - [ ] Redis ready-job index/signals with PostgreSQL reconciliation;
 - [ ] Redis-backed worker presence and heartbeat expiry;
 - [ ] worker process with configurable concurrency;
-- [ ] integration tests against a real database;
-- [ ] graceful shutdown and health endpoints.
+- [x] integration test against an isolated real PostgreSQL database;
+- [x] graceful shutdown and health endpoints.
 
 Acceptance test: run two workers concurrently against 1,000 jobs and prove every job reaches completion with no simultaneously valid duplicate lease.
 
@@ -436,12 +437,13 @@ Frontend checkpoint: refresh the browser or restart the API and recover the same
 
 Deliverables:
 
-- [ ] lease expiry and automatic re-queue;
-- [ ] heartbeat extension;
-- [ ] failure endpoint and error recording;
-- [ ] exponential backoff with jitter;
-- [ ] dead-letter queue and manual retry;
-- [ ] queued/delayed cancellation plus cooperative processing cancellation;
+- [x] lease expiry and automatic re-queue;
+- [x] heartbeat extension;
+- [x] failure endpoint and error recording;
+- [x] bounded exponential backoff;
+- [ ] randomized retry jitter;
+- [x] dead-letter queue and manual retry;
+- [x] queued/delayed cancellation plus cooperative processing cancellation;
 - [ ] fault-injection tests that kill workers mid-job.
 
 Acceptance test: kill a worker after it claims a job, observe lease expiry, and show another worker completing the job. Then demonstrate rejection of the stale worker's completion.
@@ -452,9 +454,10 @@ Frontend checkpoint: use the demo controls to stop a worker and visibly follow l
 
 Deliverables:
 
-- [ ] `scheduleAt` and `delay` support;
+- [x] `scheduleAt` and `delay` support;
 - [ ] scheduler/reaper process;
-- [ ] priority ordering with a documented starvation strategy;
+- [x] priority ordering;
+- [ ] aging/starvation-prevention strategy;
 - [ ] queue pause/resume;
 - [ ] per-queue and per-worker concurrency controls;
 - [ ] clock-boundary and ordering tests.

@@ -163,13 +163,21 @@ export class PostgresJobStore implements JobStore {
       await client.query("BEGIN");
       const expired = await client.query(
         `UPDATE jobs
-         SET status = 'queued', lease_id = NULL, lease_expires_at = NULL,
-             available_at = now(), updated_at = now()
-         WHERE status = 'processing' AND lease_expires_at <= now()
+         SET status = CASE WHEN status = 'cancel_requested' THEN 'cancelled' ELSE 'queued' END,
+             cancelled_at = CASE WHEN status = 'cancel_requested' THEN now() ELSE cancelled_at END,
+             lease_id = NULL, lease_expires_at = NULL, available_at = now(), updated_at = now()
+         WHERE status IN ('processing', 'cancel_requested') AND lease_expires_at <= now()
          RETURNING *`,
       );
       for (const row of expired.rows) {
-        await insertEvent(client, mapJob(row), "lease_expired", "processing", {});
+        const expiredJob = mapJob(row);
+        await insertEvent(
+          client,
+          expiredJob,
+          expiredJob.status === "cancelled" ? "cancelled" : "lease_expired",
+          expiredJob.status === "cancelled" ? "cancel_requested" : "processing",
+          {},
+        );
       }
 
       const candidate = await client.query(
@@ -250,17 +258,30 @@ export class PostgresJobStore implements JobStore {
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
+      const selected = await client.query("SELECT * FROM jobs WHERE id = $1 FOR UPDATE", [jobId]);
+      if (!selected.rows[0]) throw new QueueError("JOB_NOT_FOUND", "Job not found", 404);
+      const current = mapJob(selected.rows[0]);
+      assertOwned(current, leaseId, true);
+      const cancelled = current.status === "cancel_requested";
       const updated = await client.query(
         `UPDATE jobs
-         SET status = 'completed', result = $3, completed_at = now(), updated_at = now(),
+         SET status = $2, result = CASE WHEN $2 = 'completed' THEN $3 ELSE result END,
+             completed_at = CASE WHEN $2 = 'completed' THEN now() ELSE completed_at END,
+             cancelled_at = CASE WHEN $2 = 'cancelled' THEN now() ELSE cancelled_at END,
+             updated_at = now(),
              lease_id = NULL, lease_expires_at = NULL
-         WHERE id = $1 AND lease_id = $2 AND status = 'processing' AND lease_expires_at > now()
+         WHERE id = $1
          RETURNING *`,
-        [jobId, leaseId, result],
+        [jobId, cancelled ? "cancelled" : "completed", result],
       );
-      if (!updated.rows[0]) await throwLeaseError(client, jobId, leaseId);
       const job = mapJob(updated.rows[0]);
-      await insertEvent(client, job, "completed", "processing", { result });
+      await insertEvent(
+        client,
+        job,
+        cancelled ? "cancelled" : "completed",
+        current.status,
+        cancelled ? { acknowledgedByWorker: true } : { result },
+      );
       await client.query("COMMIT");
       return job;
     } catch (error) {
@@ -277,8 +298,21 @@ export class PostgresJobStore implements JobStore {
       await client.query("BEGIN");
       const selected = await client.query("SELECT * FROM jobs WHERE id = $1 FOR UPDATE", [jobId]);
       if (!selected.rows[0]) throw new QueueError("JOB_NOT_FOUND", "Job not found", 404);
-      assertOwned(mapJob(selected.rows[0]), leaseId);
       const current = mapJob(selected.rows[0]);
+      assertOwned(current, leaseId, true);
+      if (current.status === "cancel_requested") {
+        const cancelled = await client.query(
+          `UPDATE jobs SET status = 'cancelled', cancelled_at = now(), updated_at = now(),
+             lease_id = NULL, lease_expires_at = NULL WHERE id = $1 RETURNING *`,
+          [jobId],
+        );
+        const job = mapJob(cancelled.rows[0]);
+        await insertEvent(client, job, "cancelled", "cancel_requested", {
+          acknowledgedByWorker: true,
+        });
+        await client.query("COMMIT");
+        return job;
+      }
       const retrying = current.attempts <= current.maxRetries;
       const delayMs = Math.min(1_000 * 2 ** Math.max(current.attempts - 1, 0), 30_000);
       const status: JobStatus = retrying ? "retrying" : "dead_letter";
@@ -423,8 +457,8 @@ async function throwLeaseError(client: PoolClient, jobId: string, leaseId: strin
   throw new QueueError("LEASE_CONFLICT", "The lease could not be updated", 409);
 }
 
-function assertOwned(job: Job, leaseId: string): void {
-  if (job.status !== "processing") {
+function assertOwned(job: Job, leaseId: string, allowCancelRequested = false): void {
+  if (job.status !== "processing" && !(allowCancelRequested && job.status === "cancel_requested")) {
     throw new QueueError(
       "JOB_NOT_PROCESSING",
       `Cannot acknowledge a job in the ${job.status} state`,

@@ -84,6 +84,44 @@ export function createApp({ store, broker, worker }: AppDependencies) {
     response.status(200).json({ status: "ok" });
   });
 
+  app.get("/health/ready", (_request, response) => {
+    response.status(200).json({ status: "ready" });
+  });
+
+  app.get(
+    "/metrics",
+    asyncRoute(async (_request, response) => {
+      const queues = await store.queues();
+      const workerStatus = worker.status();
+      const totals = queues.reduce(
+        (aggregate, queue) => {
+          aggregate.queued += queue.counts.queued;
+          aggregate.processing += queue.counts.processing;
+          aggregate.completed += queue.counts.completed;
+          aggregate.deadLetter += queue.counts.dead_letter;
+          return aggregate;
+        },
+        { queued: 0, processing: 0, completed: 0, deadLetter: 0 },
+      );
+      response.type("text/plain; version=0.0.4").send(
+        [
+          "# HELP djqueue_jobs Number of jobs by lifecycle state.",
+          "# TYPE djqueue_jobs gauge",
+          `djqueue_jobs{status="queued"} ${totals.queued}`,
+          `djqueue_jobs{status="processing"} ${totals.processing}`,
+          `djqueue_jobs{status="completed"} ${totals.completed}`,
+          `djqueue_jobs{status="dead_letter"} ${totals.deadLetter}`,
+          "# HELP djqueue_demo_worker_running Whether the demo worker is running.",
+          "# TYPE djqueue_demo_worker_running gauge",
+          `djqueue_demo_worker_running ${workerStatus.running ? 1 : 0}`,
+          `djqueue_demo_worker_completed_total ${workerStatus.completed}`,
+          `djqueue_demo_worker_failed_total ${workerStatus.failed}`,
+          "",
+        ].join("\n"),
+      );
+    }),
+  );
+
   app.get(
     "/v1/system/snapshot",
     asyncRoute(async (_request, response) => {
@@ -263,6 +301,10 @@ export function createApp({ store, broker, worker }: AppDependencies) {
       response.status(200).json({ queues: await store.queues() });
     }),
   );
+
+  app.get("/v1/workers", (_request, response) => {
+    response.status(200).json({ workers: [worker.status()] });
+  });
 
   app.get("/v1/demo/worker", (_request, response) => response.json(worker.status()));
   app.post("/v1/demo/worker/start", (_request, response) => {

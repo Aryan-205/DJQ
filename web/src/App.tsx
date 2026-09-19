@@ -294,6 +294,10 @@ function CreateJobPanel({
   const [delayMs, setDelayMs] = useState(0);
   const [idempotencyKey, setIdempotencyKey] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const curlPreview = `curl http://localhost:3000/v1/jobs \\
+  -X POST \\
+  -H 'content-type: application/json'${idempotencyKey ? ` \\\n  -H 'idempotency-key: ${idempotencyKey}'` : ""} \\
+  -d '${JSON.stringify({ queue, type, payload: safeJson(payload), priority, maxRetries, delayMs })}'`;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -361,6 +365,10 @@ function CreateJobPanel({
           Idempotency key <span className="optional">optional</span>
           <input value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} placeholder="checkout-order-42" />
         </label>
+        <details className="curl-preview">
+          <summary>Equivalent curl request</summary>
+          <pre>{curlPreview}</pre>
+        </details>
         <button className="primary-button" type="submit" disabled={submitting}>
           {submitting ? "Submitting…" : "Submit job"}
           <span>→</span>
@@ -544,4 +552,15 @@ function eventGlyph(type: string) {
   if (type.includes("retry")) return "↻";
   if (type.includes("cancel")) return "×";
   return "+";
+}
+
+function safeJson(value: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }

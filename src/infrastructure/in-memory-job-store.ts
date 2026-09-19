@@ -158,8 +158,17 @@ export class InMemoryJobStore implements JobStore {
   }
 
   async complete(jobId: string, leaseId: string, result: JsonObject = {}): Promise<Job> {
-    const job = this.#ownedJob(jobId, leaseId);
+    const job = this.#ownedJob(jobId, leaseId, true);
     const fromStatus = job.status;
+    if (job.status === "cancel_requested") {
+      job.status = "cancelled";
+      job.cancelledAt = new Date().toISOString();
+      job.updatedAt = job.cancelledAt;
+      delete job.leaseId;
+      delete job.leaseExpiresAt;
+      this.#record(job, "cancelled", fromStatus, { acknowledgedByWorker: true });
+      return copy(job);
+    }
     job.status = "completed";
     job.result = copy(result);
     job.completedAt = new Date().toISOString();
@@ -171,7 +180,16 @@ export class InMemoryJobStore implements JobStore {
   }
 
   async fail(jobId: string, leaseId: string, error: JsonObject): Promise<Job> {
-    const job = this.#ownedJob(jobId, leaseId);
+    const job = this.#ownedJob(jobId, leaseId, true);
+    if (job.status === "cancel_requested") {
+      job.status = "cancelled";
+      job.cancelledAt = new Date().toISOString();
+      job.updatedAt = job.cancelledAt;
+      delete job.leaseId;
+      delete job.leaseExpiresAt;
+      this.#record(job, "cancelled", "cancel_requested", { acknowledgedByWorker: true });
+      return copy(job);
+    }
     job.lastError = copy(error);
     delete job.leaseId;
     delete job.leaseExpiresAt;
@@ -238,9 +256,9 @@ export class InMemoryJobStore implements JobStore {
     return job;
   }
 
-  #ownedJob(jobId: string, leaseId: string): Job {
+  #ownedJob(jobId: string, leaseId: string, allowCancelRequested = false): Job {
     const job = this.#requiredJob(jobId);
-    if (job.status !== "processing") {
+    if (job.status !== "processing" && !(allowCancelRequested && job.status === "cancel_requested")) {
       throw new QueueError(
         "JOB_NOT_PROCESSING",
         `Cannot acknowledge a job in the ${job.status} state`,
@@ -260,16 +278,23 @@ export class InMemoryJobStore implements JobStore {
     const now = Date.now();
     for (const job of this.#jobs.values()) {
       if (
-        job.status === "processing" &&
+        ["processing", "cancel_requested"].includes(job.status) &&
         job.leaseExpiresAt &&
         Date.parse(job.leaseExpiresAt) <= now
       ) {
         delete job.leaseId;
         delete job.leaseExpiresAt;
-        job.status = "queued";
+        const cancellationPending = job.status === "cancel_requested";
+        job.status = cancellationPending ? "cancelled" : "queued";
         job.availableAt = new Date(now).toISOString();
         job.updatedAt = job.availableAt;
-        this.#record(job, "lease_expired", "processing", {});
+        if (cancellationPending) job.cancelledAt = job.updatedAt;
+        this.#record(
+          job,
+          cancellationPending ? "cancelled" : "lease_expired",
+          cancellationPending ? "cancel_requested" : "processing",
+          {},
+        );
       }
     }
   }

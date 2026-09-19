@@ -74,3 +74,74 @@ test("claims higher-priority queued work first", async () => {
   const claim = await store.claim("email");
   assert.equal(claim?.job.id, high.job.id);
 });
+
+test("keeps delayed work hidden until it is eligible", async () => {
+  const store = new InMemoryJobStore();
+  const { job } = await store.submit({
+    queue: "reports",
+    type: "daily-report",
+    payload: {},
+    delayMs: 60_000,
+  });
+
+  assert.equal(job.status, "delayed");
+  assert.equal(await store.claim("reports"), undefined);
+});
+
+test("schedules a retry after a failed attempt", async () => {
+  const store = new InMemoryJobStore();
+  const { job } = await store.submit({
+    queue: "email",
+    type: "flaky-email",
+    payload: {},
+    maxRetries: 2,
+  });
+  const claim = await store.claim("email");
+  assert.ok(claim);
+
+  const failed = await store.fail(job.id, claim.leaseId, {
+    code: "SMTP_TIMEOUT",
+  });
+  assert.equal(failed.status, "retrying");
+  assert.equal(failed.lastError?.code, "SMTP_TIMEOUT");
+  assert.ok(Date.parse(failed.availableAt) > Date.now());
+  assert.deepEqual(
+    (await store.events(job.id)).map((event) => event.type),
+    ["submitted", "claimed", "failed", "retry_scheduled"],
+  );
+});
+
+test("moves an exhausted job to the dead-letter queue and supports manual retry", async () => {
+  const store = new InMemoryJobStore();
+  const { job } = await store.submit({
+    queue: "payments",
+    type: "capture-payment",
+    payload: {},
+    maxRetries: 0,
+  });
+  const claim = await store.claim("payments");
+  assert.ok(claim);
+  const dead = await store.fail(job.id, claim.leaseId, { code: "DECLINED" });
+  assert.equal(dead.status, "dead_letter");
+
+  const retried = await store.retry(job.id);
+  assert.equal(retried.status, "queued");
+  assert.equal(retried.attempts, 0);
+  assert.equal(retried.lastError, undefined);
+});
+
+test("cooperatively finishes a cancellation requested during processing", async () => {
+  const store = new InMemoryJobStore();
+  const { job } = await store.submit({
+    queue: "video",
+    type: "transcode",
+    payload: {},
+  });
+  const claim = await store.claim("video");
+  assert.ok(claim);
+
+  const requested = await store.cancel(job.id);
+  assert.equal(requested.status, "cancel_requested");
+  const cancelled = await store.complete(job.id, claim.leaseId, {});
+  assert.equal(cancelled.status, "cancelled");
+});
